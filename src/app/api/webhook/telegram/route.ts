@@ -1,10 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { TelegramUpdate, sendMessage, sendMediaToChannel, sendLog } from '@/lib/telegram';
+import { TelegramUpdate, sendMessage, sendMediaToChannel, sendLog, escapeHtml } from '@/lib/telegram';
 import { saveImage, generateId, getStats, registerUser, createLinkToken, isAccountLinked, getLinkedWebAccount, unlinkTelegramAccount, getImage } from '@/lib/db';
 import { validateCustomId, generateSuggestions } from '@/lib/slugs';
 
 export async function POST(req: NextRequest) {
     try {
+        // Verify Telegram Webhook Secret Token if configured
+        const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+        if (webhookSecret) {
+            const incomingSecret = req.headers.get('x-telegram-bot-api-secret-token');
+            if (incomingSecret !== webhookSecret) {
+                return new NextResponse('Unauthorized', { status: 401 });
+            }
+        }
+
         const body: TelegramUpdate = await req.json();
 
         // Handle callback queries FIRST
@@ -62,9 +71,10 @@ export async function POST(req: NextRequest) {
 
         if (!from) return new NextResponse('OK');
 
+        const rawName = from.first_name || '';
         const userLink = from.username
-            ? `@${from.username}`
-            : `${from.first_name} [${from.id}]`;
+            ? `@${escapeHtml(from.username)}`
+            : `${escapeHtml(rawName)} [${from.id}]`;
 
         if (text) {
             const command = text.split(' ')[0].split('@')[0].toLowerCase();
@@ -99,7 +109,7 @@ export async function POST(req: NextRequest) {
                     `• Send an <b>Image/Video/GIF</b> as a <b>Document</b>.\n` +
                     `• Or <b>Reply</b> to an existing Media with /upload or /tgm.\n\n` +
                     `<b>Commands:</b>\n` +
-                    `/login - Connect to your web account\n` +
+                    `/link or /login - Connect to your web account\n` +
                     `/status - Check account link status\n` +
                     `/disconnect - Disconnect from web account\n` +
                     `/stats - Show bot statistics\n` +
@@ -130,7 +140,7 @@ export async function POST(req: NextRequest) {
                 return new NextResponse('OK');
             }
 
-            if (command === '/login') {
+            if (command === '/login' || command === '/link') {
                 const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'https://pixedge.vercel.app';
 
                 // Generate 6-digit PIN

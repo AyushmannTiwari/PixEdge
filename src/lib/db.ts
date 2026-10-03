@@ -1,6 +1,7 @@
 
 import fs from 'fs/promises';
 import path from 'path';
+import crypto from 'crypto';
 import { Redis } from '@upstash/redis';
 import { deleteChannelMediaMessage } from '@/lib/telegram';
 
@@ -622,7 +623,7 @@ export async function generateIdSuggestions(baseId: string): Promise<string[]> {
 
 export async function createApiKey(userId: string): Promise<string> {
     if (!redis) throw new Error('Redis not configured');
-    const key = `pe_${Math.random().toString(36).substring(2)}${Math.random().toString(36).substring(2)}`;
+    const key = `pe_${crypto.randomBytes(24).toString('hex')}`;
     await redis.set(`apikey:${key}`, userId);
     await redis.set(`user:${userId}:apikey`, key);
     return key;
@@ -641,7 +642,7 @@ export async function verifyApiKey(key: string): Promise<string | null> {
 // Telegram account linking functions
 export async function createLinkToken(telegramId: string | number): Promise<string> {
     if (!redis) throw new Error('Redis not configured');
-    const token = Math.random().toString(36).substring(2, 10);
+    const token = crypto.randomBytes(16).toString('hex');
     // Store token -> telegramId mapping (expires in 5 minutes)
     await redis.set(`link_token:${token}`, telegramId.toString(), { ex: 300 });
     return token;
@@ -658,6 +659,18 @@ export async function verifyLinkToken(token: string): Promise<string | null> {
 
 export async function linkTelegramToAccount(telegramId: string, webUserId: string): Promise<void> {
     if (!redis) return;
+
+    // Clean up any stale mappings to maintain a strict 1:1 bidirectional mapping
+    const existingWebUser = await redis.get(`telegram_link:${telegramId}`);
+    if (existingWebUser && existingWebUser !== webUserId) {
+        await redis.del(`web_link:${existingWebUser}`);
+    }
+
+    const existingTelegram = await redis.get(`web_link:${webUserId}`);
+    if (existingTelegram && existingTelegram !== telegramId) {
+        await redis.del(`telegram_link:${existingTelegram}`);
+    }
+
     // Bidirectional mapping
     await redis.set(`telegram_link:${telegramId}`, webUserId);
     await redis.set(`web_link:${webUserId}`, telegramId);

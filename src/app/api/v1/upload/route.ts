@@ -261,7 +261,7 @@ export async function POST(req: NextRequest) {
         await safeSendLog(`❌ <b>Web Upload Error</b>\n\nError: ${error.message || error}`);
         return NextResponse.json({
             success: false,
-            error: { code: 'INTERNAL_ERROR', message: error.message || 'Server processed request failed' }
+            error: { code: 'INTERNAL_ERROR', message: 'Failed to process media upload' }
         }, { status: 500 });
     }
 }

@@ -115,9 +115,9 @@ curl -X DELETE https://your-domain.com/api/v1/delete/my-video \
 PixEdge includes `@PixEdge_Bot` for direct uploads from Telegram.
 
 ### Webhook Setup
-After deployment, register the webhook once:
+After deployment, register the webhook once with your secret token:
 ```
-https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://your-domain.com/api/webhook/telegram
+https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook?url=https://your-domain.com/api/webhook/telegram&secret_token=<YOUR_TELEGRAM_WEBHOOK_SECRET>
 ```
 
 ### Commands

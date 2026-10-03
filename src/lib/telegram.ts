@@ -1,3 +1,11 @@
+export function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 export interface TelegramFileResult {
   file_id: string;
   file_unique_id: string;

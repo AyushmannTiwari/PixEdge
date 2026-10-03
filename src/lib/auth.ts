@@ -87,7 +87,6 @@ export const authOptions: NextAuthOptions = {
             },
             async authorize(credentials) {
                 if (!credentials?.hash || !process.env.TELEGRAM_BOT_TOKEN) {
-                    console.log('Telegram login failed: Missing hash or TELEGRAM_BOT_TOKEN');
                     return null;
                 }
 
@@ -97,7 +96,6 @@ export const authOptions: NextAuthOptions = {
                     rawId = credentials.id;
                 }
                 if (!rawId || rawId === 'telegram-login') {
-                    console.log('Telegram login failed: Invalid telegram ID');
                     return null;
                 }
 
@@ -114,25 +112,36 @@ export const authOptions: NextAuthOptions = {
                     .map(key => `${key}=${tgUser[key]}`);
                 const dataCheckString = dataCheckArr.join('\n');
 
+                // Use Node.js crypto module
                 const crypto = require('crypto');
                 const secret = crypto.createHash('sha256').update(process.env.TELEGRAM_BOT_TOKEN).digest();
                 const hmac = crypto.createHmac('sha256', secret).update(dataCheckString).digest('hex');
 
-                if (hmac !== credentials.hash) {
-                    console.log('Telegram login failed: Hash mismatch', { calculated: hmac, received: credentials.hash, dataCheckString });
+                const hmacBuf = Buffer.from(hmac, 'hex');
+                const hashBuf = Buffer.from(credentials.hash, 'hex');
+
+                if (hmacBuf.length !== hashBuf.length || !crypto.timingSafeEqual(hmacBuf, hashBuf)) {
                     return null;
                 }
 
-                // Check expiry (24 hours)
-                const now = Math.floor(Date.now() / 1000);
-                if (credentials.auth_date && now - parseInt(credentials.auth_date) > 86400) {
-                    console.log('Telegram login failed: Auth expired');
+                // Check expiry (24 hours) and sanity check auth_date
+                const authTimestamp = parseInt(credentials.auth_date, 10);
+                if (isNaN(authTimestamp)) {
                     return null;
                 }
+
+                const now = Math.floor(Date.now() / 1000);
+                if (now - authTimestamp > 86400 || authTimestamp - now > 300) {
+                    return null;
+                }
+
+                const displayName = credentials.last_name
+                    ? `${credentials.first_name} ${credentials.last_name}`
+                    : (credentials.first_name || credentials.username || 'Telegram User');
 
                 return {
                     id: rawId,
-                    name: credentials.first_name || credentials.username || 'Telegram User',
+                    name: displayName,
                     image: credentials.photo_url || null,
                     email: `${rawId}@telegram.user`,
                 };

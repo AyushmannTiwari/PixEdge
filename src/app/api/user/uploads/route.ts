@@ -11,7 +11,15 @@ export async function GET() {
 
     try {
         const uploads = await getUserUploads(session.user.id);
-        return NextResponse.json({ uploads });
+        const sanitizedUploads = uploads.map(u => ({
+            id: u.id,
+            created_at: u.created_at,
+            expires_at: u.expires_at ?? null,
+            views: u.views,
+            downloads: u.downloads,
+            metadata: u.metadata
+        }));
+        return NextResponse.json({ uploads: sanitizedUploads });
     } catch (error) {
         console.error('Failed to fetch user uploads:', error);
         return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
