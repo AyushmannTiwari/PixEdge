@@ -86,7 +86,8 @@ export const authOptions: NextAuthOptions = {
                 hash: { label: "Hash", type: "text" }
             },
             async authorize(credentials) {
-                if (!credentials?.hash || !process.env.TELEGRAM_BOT_TOKEN) {
+                const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+                if (!credentials?.hash || !botToken) {
                     return null;
                 }
 
@@ -114,7 +115,7 @@ export const authOptions: NextAuthOptions = {
 
                 // Use Node.js crypto module
                 const crypto = require('crypto');
-                const secret = crypto.createHash('sha256').update(process.env.TELEGRAM_BOT_TOKEN).digest();
+                const secret = crypto.createHash('sha256').update(botToken).digest();
                 const hmac = crypto.createHmac('sha256', secret).update(dataCheckString).digest('hex');
 
                 const hmacBuf = Buffer.from(hmac, 'hex');

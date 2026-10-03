@@ -6,10 +6,11 @@ import { validateCustomId, generateSuggestions } from '@/lib/slugs';
 export async function POST(req: NextRequest) {
     try {
         // Verify Telegram Webhook Secret Token if configured
-        const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+        const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
         if (webhookSecret) {
             const incomingSecret = req.headers.get('x-telegram-bot-api-secret-token');
             if (incomingSecret !== webhookSecret) {
+                console.warn('[webhook] Unauthorized: secret token mismatch');
                 return new NextResponse('Unauthorized', { status: 401 });
             }
         }
@@ -168,22 +169,21 @@ export async function POST(req: NextRequest) {
                     console.error('Failed to store PIN in Redis:', e);
                 }
 
-                // Generate link token as fallback
-                const token = await createLinkToken(from.id);
-                const linkUrl = `${baseUrl}/login?link=${token}`;
+                // Generate 1-Click Login URL with PIN
+                const directLoginUrl = `${baseUrl}/login?pin=${pin}`;
 
                 await sendMessage(chatId,
                     `🔑 <b>PixEdge Web Login</b>\n\n` +
-                    `1️⃣ <b>Option A (PIN Code):</b>\n` +
+                    `1️⃣ <b>Option A (1-Click Login):</b>\n` +
+                    `Tap the button below to log in directly:\n\n` +
+                    `2️⃣ <b>Option B (PIN Code):</b>\n` +
                     `Your PIN: <code>${pin}</code>\n` +
                     `<i>Enter this PIN on the login page.</i>\n\n` +
-                    `2️⃣ <b>Option B (Direct Link):</b>\n` +
-                    `Click the button below to authorize.\n\n` +
-                    `<i>Both options expire in 5 minutes.</i>`,
+                    `<i>Expires in 5 minutes.</i>`,
                     'HTML',
                     {
                         inline_keyboard: [[
-                            { text: "🔗 1-Click Login to Website", url: linkUrl }
+                            { text: "🔗 1-Click Login to Website", url: directLoginUrl }
                         ]]
                     }
                 );

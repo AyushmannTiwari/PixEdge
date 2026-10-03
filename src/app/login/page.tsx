@@ -245,6 +245,40 @@ function LoginPageContent() {
         }
     }, [searchParams]);
 
+    // Handle Telegram URL params (from redirect or 1-click pin)
+    useEffect(() => {
+        // 1. Check for 1-click PIN in URL
+        const pinFromUrl = searchParams.get('pin');
+        if (pinFromUrl && pinFromUrl.trim().length === 6) {
+            setPinCode(pinFromUrl.trim());
+            setPinLoading(true);
+            signIn('telegram-pin', { pin: pinFromUrl.trim(), redirect: false }).then((result) => {
+                if (result?.error) {
+                    setError('Invalid or expired Telegram PIN. Send /login in bot to get a new PIN.');
+                    setPinLoading(false);
+                } else {
+                    router.push('/dashboard');
+                }
+            });
+            return;
+        }
+
+        // 2. Check for Telegram OAuth redirect params in URL
+        const hash = searchParams.get('hash');
+        const id = searchParams.get('id');
+        if (hash && id) {
+            handleTelegramLogin({
+                id,
+                first_name: searchParams.get('first_name') || '',
+                last_name: searchParams.get('last_name') || '',
+                username: searchParams.get('username') || '',
+                photo_url: searchParams.get('photo_url') || '',
+                auth_date: searchParams.get('auth_date') || '',
+                hash,
+            });
+        }
+    }, [searchParams]);
+
     // Handle session and linking
     useEffect(() => {
         if (session) {
@@ -285,22 +319,27 @@ function LoginPageContent() {
     const [pinLoading, setPinLoading] = useState(false);
 
     useEffect(() => {
-        if (telegramWrapperRef.current) {
-            const botName = process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME || "PixEdge_bot";
-            const script = document.createElement('script');
-            script.src = "https://telegram.org/js/telegram-widget.js?22";
-            script.setAttribute("data-telegram-login", botName);
-            script.setAttribute("data-size", "large");
-            script.setAttribute("data-radius", "8");
-            script.setAttribute("data-request-access", "write");
-            script.setAttribute("data-userpic", "false");
-            script.setAttribute("data-onauth", "onTelegramAuth(user)");
-            script.async = true;
-            telegramWrapperRef.current.innerHTML = '';
-            telegramWrapperRef.current.appendChild(script);
-            // @ts-ignore
-            window.onTelegramAuth = (user: any) => handleTelegramLogin(user);
+        if (!telegramWrapperRef.current) return;
+
+        // @ts-ignore
+        window.onTelegramAuth = (user: any) => handleTelegramLogin(user);
+
+        const botName = process.env.NEXT_PUBLIC_TELEGRAM_BOT_USERNAME || "PixEdge_bot";
+        const script = document.createElement('script');
+        script.src = "https://telegram.org/js/telegram-widget.js?22";
+        script.setAttribute("data-telegram-login", botName);
+        script.setAttribute("data-size", "large");
+        script.setAttribute("data-radius", "8");
+        script.setAttribute("data-request-access", "write");
+        script.setAttribute("data-userpic", "false");
+        script.setAttribute("data-onauth", "onTelegramAuth(user)");
+        if (typeof window !== 'undefined') {
+            script.setAttribute("data-auth-url", `${window.location.origin}/login`);
         }
+        script.async = true;
+
+        telegramWrapperRef.current.innerHTML = '';
+        telegramWrapperRef.current.appendChild(script);
     }, [isLogin]);
 
     const handleTelegramLogin = async (user: any) => {
