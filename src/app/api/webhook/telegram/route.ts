@@ -461,19 +461,21 @@ async function processFile(
 
         let messageId: number | undefined = undefined;
 
-        // 1. Forward to DB Channel with caption
+        // Forward to Telegram storage first. Never publish a link without confirmed storage.
         try {
-            const channelResult = await sendMediaToChannel(fileId, `👤 <b>Uploaded by:</b> ${userLink}`, mediaType);
-            if (channelResult && 'message_id' in (channelResult as any)) {
-                messageId = (channelResult as any).message_id;
+            const channelResult: any = await sendMediaToChannel(fileId, `👤 <b>Uploaded by:</b> ${userLink}`, mediaType);
+            if (!channelResult || !Number.isFinite(channelResult.message_id)) {
+                throw new Error('Storage channel did not return a valid message_id.');
             }
+            messageId = channelResult.message_id;
         } catch (channelError: any) {
             console.error('Channel forward error:', channelError);
-            await sendLog(`⚠️ <b>Channel Forward Failed</b>\n\nUser: ${userLink}\nError: ${channelError.message || channelError}`);
-            // We continue anyway so the user gets their link
+            await sendLog(`⚠️ <b>Channel Forward Failed</b>\\n\\nUser: ${userLink}\\nError: ${channelError?.message || channelError}`);
+            await sendMessage(chatId, '❌ Upload failed because the file could not be saved to storage. Please try again later.');
+            return;
         }
 
-        // 2. Save to DB (use linked web account if available)
+        // Save the record only after Telegram confirms storage succeeded.
         await saveImage({
             id,
             telegram_file_id: fileId,
@@ -482,7 +484,7 @@ async function processFile(
             metadata: {
                 size: fileSize,
                 type: mimeType,
-                version: messageId && gramReady ? 'v2' : 'v1'
+                version: gramReady ? 'v2' : 'v1'
             }
         }, 'bot', trackingUserId);
 
