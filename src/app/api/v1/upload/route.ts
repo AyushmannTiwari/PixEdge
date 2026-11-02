@@ -315,6 +315,12 @@ export async function POST(req: NextRequest) {
             : 50;
         const MAX_SIZE = maxMB * 1024 * 1024;
 
+        if (!Number.isFinite(fileSize) || fileSize <= 0) {
+            return NextResponse.json({
+                success: false,
+                error: { code: 'INVALID_FILE_SIZE', message: 'The uploaded file size could not be verified.' }
+            }, { status: 400 });
+        }
         if (fileSize > MAX_SIZE) {
             return NextResponse.json({
                 success: false,
