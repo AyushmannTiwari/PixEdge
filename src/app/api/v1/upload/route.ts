@@ -201,6 +201,8 @@ function parseMultipartUpload(req: NextRequest): Promise<ParsedMultipart> {
 export async function POST(req: NextRequest) {
     let userId: string | undefined;
     let ip = 'anonymous';
+    let reservationHeld = false;
+    let slugReservationKey: string | null = null;
     try {
         userId = await resolveUserId(req);
         const forwarded = req.headers.get('x-real-ip') || req.headers.get('x-forwarded-for') || 'anonymous';
@@ -353,7 +355,6 @@ export async function POST(req: NextRequest) {
 
         // Atomic reservation prevents simultaneous uploads from claiming the same custom ID.
         const slugReservationKey = customId ? `slug:reservation:${id}` : null;
-        let reservationHeld = false;
         if (slugReservationKey) {
             const redisUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
             const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
