@@ -5,6 +5,7 @@ import CredentialsProvider from "next-auth/providers/credentials";
 import { UpstashRedisAdapter } from "@auth/upstash-redis-adapter";
 import { Redis } from "@upstash/redis";
 import bcrypt from "bcryptjs";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 declare module "next-auth" {
     interface Session {
@@ -17,22 +18,39 @@ declare module "next-auth" {
     }
 }
 
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+if (!redisUrl || !redisToken) throw new Error("Upstash Redis credentials are required for authentication.");
+const redis = new Redis({ url: redisUrl, token: redisToken });
 
-// Initialize Redis client
-const redis = new Redis({
-    url: process.env.UPSTASH_REDIS_REST_URL!,
-    token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-});
+const RATE_WINDOW_SECONDS = 15 * 60;
+
+async function rateLimitAllowed(key: string, limit: number, windowSeconds = RATE_WINDOW_SECONDS): Promise<boolean> {
+    const count = await redis.eval<number>(
+        "local n = redis.call('INCR', KEYS[1]); if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]); end; return n",
+        [key],
+        [String(windowSeconds)]
+    );
+    return Number(count) <= limit;
+}
+
+function getClientIp(headers: Record<string, string | undefined> | undefined): string {
+    const raw = headers?.["x-real-ip"] || headers?.["x-forwarded-for"] || "unknown";
+    return raw.split(",")[0].trim().slice(0, 128) || "unknown";
+}
+
+function safeHashEqual(expectedHex: string, suppliedHex: string): boolean {
+    if (!/^[a-f0-9]{64}$/i.test(suppliedHex)) return false;
+    const expected = Buffer.from(expectedHex, "hex");
+    const supplied = Buffer.from(suppliedHex, "hex");
+    return expected.length === supplied.length && timingSafeEqual(expected, supplied);
+}
 
 export const authOptions: NextAuthOptions = {
-    // @ts-ignore
+    // @ts-ignore - adapter package exposes a narrower type than NextAuthOptions.
     adapter: UpstashRedisAdapter(redis),
-    session: {
-        strategy: "jwt",
-    },
-    pages: {
-        signIn: '/login',
-    },
+    session: { strategy: "jwt" },
+    pages: { signIn: "/login" },
     providers: [
         GithubProvider({
             clientId: process.env.GITHUB_ID || "",
@@ -48,28 +66,29 @@ export const authOptions: NextAuthOptions = {
                 email: { label: "Email", type: "email" },
                 password: { label: "Password", type: "password" }
             },
-            async authorize(credentials) {
+            async authorize(credentials, req) {
                 if (!credentials?.email || !credentials?.password) return null;
+                const email = credentials.email.trim().toLowerCase();
+                if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return null;
 
-                const userEmailKey = `user:email:${credentials.email}`;
-                const userId = await redis.get(userEmailKey);
+                const ipHash = createHash("sha256").update(getClientIp(req?.headers)).digest("hex");
+                const emailHash = createHash("sha256").update(email).digest("hex");
+                const [ipAllowed, emailAllowed] = await Promise.all([
+                    rateLimitAllowed(`ratelimit:auth:password:ip:${ipHash}`, 30),
+                    rateLimitAllowed(`ratelimit:auth:password:email:${emailHash}`, 10)
+                ]);
+                if (!ipAllowed || !emailAllowed) return null;
 
-                if (!userId) return null;
-
-                const user: any = await redis.get(`user:${userId}`);
-                if (!user || !user.passwordHash) return null;
-
-                const isValid = await bcrypt.compare(credentials.password, user.passwordHash);
-
-                if (isValid) {
-                    return {
-                        id: user.id || userId as string,
-                        name: user.name,
-                        email: user.email,
-                        image: user.image
-                    };
+                let userId = await redis.get<string>(`user:email:${email}`);
+                // Existing installations may contain pre-normalized email keys.
+                if (!userId && credentials.email.trim() !== email) {
+                    userId = await redis.get<string>(`user:email:${credentials.email.trim()}`);
                 }
-                return null;
+                if (!userId) return null;
+                const user: any = await redis.get(`user:${userId}`);
+                if (!user?.passwordHash || user.emailVerified === false) return null;
+                if (!await bcrypt.compare(credentials.password, user.passwordHash)) return null;
+                return { id: String(user.id || userId), name: user.name, email: user.email, image: user.image };
             }
         }),
         CredentialsProvider({
@@ -85,94 +104,70 @@ export const authOptions: NextAuthOptions = {
                 auth_date: { label: "Auth Date", type: "text" },
                 hash: { label: "Hash", type: "text" }
             },
-            async authorize(credentials) {
+            async authorize(credentials, req) {
                 const botToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
-                if (!credentials?.hash || !botToken) {
-                    return null;
-                }
+                if (!credentials?.hash || !botToken) return null;
+                const rawId = credentials.telegram_id && credentials.telegram_id !== "telegram-login"
+                    ? credentials.telegram_id : credentials.id;
+                if (!rawId || !/^\d{1,20}$/.test(rawId)) return null;
 
-                // Numeric Telegram User ID (ignore provider ID "telegram-login")
-                let rawId = credentials.telegram_id;
-                if (!rawId || rawId === 'telegram-login') {
-                    rawId = credentials.id;
-                }
-                if (!rawId || rawId === 'telegram-login') {
-                    return null;
-                }
-
-                const tgUser: Record<string, string> = {};
-                tgUser['id'] = rawId;
-                if (credentials.first_name && credentials.first_name !== 'undefined') tgUser['first_name'] = credentials.first_name;
-                if (credentials.last_name && credentials.last_name !== 'undefined') tgUser['last_name'] = credentials.last_name;
-                if (credentials.username && credentials.username !== 'undefined') tgUser['username'] = credentials.username;
-                if (credentials.photo_url && credentials.photo_url !== 'undefined') tgUser['photo_url'] = credentials.photo_url;
-                if (credentials.auth_date && credentials.auth_date !== 'undefined') tgUser['auth_date'] = credentials.auth_date;
-
-                const dataCheckArr = Object.keys(tgUser)
-                    .sort()
-                    .map(key => `${key}=${tgUser[key]}`);
-                const dataCheckString = dataCheckArr.join('\n');
-
-                // Use Node.js crypto module
-                const crypto = require('crypto');
-                const secret = crypto.createHash('sha256').update(botToken).digest();
-                const hmac = crypto.createHmac('sha256', secret).update(dataCheckString).digest('hex');
-
-                const hmacBuf = Buffer.from(hmac, 'hex');
-                const hashBuf = Buffer.from(credentials.hash, 'hex');
-
-                if (hmacBuf.length !== hashBuf.length || !crypto.timingSafeEqual(hmacBuf, hashBuf)) {
-                    return null;
-                }
-
-                // Check expiry (24 hours) and sanity check auth_date
-                const authTimestamp = parseInt(credentials.auth_date, 10);
-                if (isNaN(authTimestamp)) {
-                    return null;
-                }
-
+                const authDateRaw = credentials.auth_date || "";
+                if (!/^\d{1,12}$/.test(authDateRaw)) return null;
+                const authDate = Number(authDateRaw);
                 const now = Math.floor(Date.now() / 1000);
-                if (now - authTimestamp > 86400 || authTimestamp - now > 300) {
-                    return null;
+                if (!Number.isSafeInteger(authDate) || authDate > now + 60 || now - authDate > 300) return null;
+
+                const ipHash = createHash("sha256").update(getClientIp(req?.headers)).digest("hex");
+                if (!await rateLimitAllowed(`ratelimit:auth:telegram-widget:ip:${ipHash}`, 30)) return null;
+
+                const user: Record<string, string> = { id: rawId };
+                for (const key of ["first_name", "last_name", "username", "photo_url"] as const) {
+                    const value = credentials[key];
+                    if (value && value !== "undefined") user[key] = value;
                 }
+                user.auth_date = authDateRaw;
 
-                const displayName = credentials.last_name
-                    ? `${credentials.first_name} ${credentials.last_name}`
-                    : (credentials.first_name || credentials.username || 'Telegram User');
+                const checkString = Object.keys(user).sort().map(key => `${key}=${user[key]}`).join("\n");
+                const secret = createHash("sha256").update(botToken).digest();
+                const expected = createHmac("sha256", secret).update(checkString).digest("hex");
+                if (!safeHashEqual(expected, credentials.hash)) return null;
 
-                return {
-                    id: rawId,
-                    name: displayName,
-                    image: credentials.photo_url || null,
-                    email: `${rawId}@telegram.user`,
-                };
+                const replayKey = `telegram:auth_replay:${createHash("sha256").update(credentials.hash).digest("hex")}`;
+                const claimed = await redis.set(replayKey, "1", { ex: 300, nx: true });
+                if (claimed !== "OK") return null;
+
+                const name = credentials.last_name
+                    ? `${credentials.first_name || ""} ${credentials.last_name}`.trim()
+                    : (credentials.first_name || credentials.username || "Telegram User");
+                return { id: rawId, name, image: credentials.photo_url || null, email: `${rawId}@telegram.user` };
             }
         }),
         CredentialsProvider({
             id: "telegram-pin",
             name: "Telegram PIN",
-            credentials: {
-                pin: { label: "PIN", type: "text" }
-            },
-            async authorize(credentials) {
-                if (!credentials?.pin) return null;
+            credentials: { pin: { label: "PIN", type: "text" } },
+            async authorize(credentials, req) {
+                const pin = credentials?.pin?.trim() || "";
+                if (!/^\d{6}$/.test(pin)) return null;
+                const ipHash = createHash("sha256").update(getClientIp(req?.headers)).digest("hex");
+                if (!await rateLimitAllowed(`ratelimit:auth:telegram-pin:ip:${ipHash}`, 10)) return null;
 
-                const cleanPin = credentials.pin.trim();
-                const pinKey = `telegram:login_pin:${cleanPin}`;
-                const data: any = await redis.get(pinKey);
-
+                // Atomic consume. Only one request can ever authenticate with a given PIN.
+                const data: any = await redis.eval<string | null>(
+                    "return redis.call('GETDEL', KEYS[1])",
+                    [`telegram:login_pin:${pin}`],
+                    []
+                );
                 if (!data) return null;
-
-                // Delete PIN after single-use authentication
-                await redis.del(pinKey);
-
-                const userData = typeof data === 'string' ? JSON.parse(data) : data;
-
+                let userData: any;
+                try { userData = typeof data === "string" ? JSON.parse(data) : data; }
+                catch { return null; }
+                if (!userData?.id || !/^\d{1,20}$/.test(String(userData.id))) return null;
                 return {
-                    id: userData.id.toString(),
-                    name: userData.first_name || userData.name || 'Telegram User',
+                    id: String(userData.id),
+                    name: userData.first_name || userData.name || "Telegram User",
                     image: userData.photo_url || null,
-                    email: `${userData.id}@telegram.user`,
+                    email: `${userData.id}@telegram.user`
                 };
             }
         })
@@ -180,29 +175,19 @@ export const authOptions: NextAuthOptions = {
     callbacks: {
         async session({ session, token }) {
             if (session.user && token.sub) {
-                // @ts-ignore
                 session.user.id = token.sub;
-                
-                // Fetch custom avatar or saved Telegram image if available in Redis
                 try {
-                    const customAvatar: string | null = await redis.get(`user:custom_avatar:${token.sub}`);
-                    if (customAvatar) {
-                        session.user.image = customAvatar;
-                    } else if (token.picture) {
-                        session.user.image = token.picture;
-                    }
-                } catch (e) {
-                    // Fallback to token picture
-                }
+                    const avatar: string | null = await redis.get(`user:custom_avatar:${token.sub}`);
+                    if (avatar) session.user.image = avatar;
+                    else if (token.picture) session.user.image = token.picture as string;
+                } catch { /* Keep JWT picture as fallback. */ }
             }
             return session;
         },
         async jwt({ token, user, account }) {
             if (account && user) {
                 token.sub = user.id;
-                if (user.image) {
-                    token.picture = user.image;
-                }
+                if (user.image) token.picture = user.image;
             }
             return token;
         }
