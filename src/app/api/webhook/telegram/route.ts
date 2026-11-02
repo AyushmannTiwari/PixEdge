@@ -1,18 +1,51 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { randomInt, timingSafeEqual } from 'node:crypto';
+import { Redis } from '@upstash/redis';
 import { TelegramUpdate, sendMessage, sendMediaToChannel, sendLog, escapeHtml } from '@/lib/telegram';
+
+export const runtime = 'nodejs';
+
+const LOGIN_RATE_LIMIT = 5;
+const LOGIN_RATE_WINDOW_SECONDS = 15 * 60;
+
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+const redis = redisUrl && redisToken ? new Redis({ url: redisUrl, token: redisToken }) : null;
+
+async function enforceRateLimit(key: string, limit: number, windowSeconds: number): Promise<boolean> {
+    if (!redis) throw new Error('Redis is required for webhook rate limiting.');
+    const count = await redis.eval<number>(
+        "local n = redis.call('INCR', KEYS[1]); if n == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]); end; return n",
+        [key],
+        [String(windowSeconds)]
+    );
+    return Number(count) <= limit;
+}
+
+function validWebhookSecret(incoming: string | null, expected: string): boolean {
+    if (!incoming) return false;
+    const a = Buffer.from(incoming);
+    const b = Buffer.from(expected);
+    return a.length === b.length && timingSafeEqual(a, b);
+}
 import { saveImage, generateId, getStats, registerUser, createLinkToken, isAccountLinked, getLinkedWebAccount, unlinkTelegramAccount, getImage } from '@/lib/db';
 import { validateCustomId, generateSuggestions } from '@/lib/slugs';
 
 export async function POST(req: NextRequest) {
     try {
-        // Verify Telegram Webhook Secret Token if configured
+        // The webhook must never be exposed without a configured Telegram secret.
         const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
-        if (webhookSecret) {
-            const incomingSecret = req.headers.get('x-telegram-bot-api-secret-token');
-            if (incomingSecret !== webhookSecret) {
-                console.warn('[webhook] Unauthorized: secret token mismatch');
-                return new NextResponse('Unauthorized', { status: 401 });
-            }
+        if (!webhookSecret) {
+            console.error('[webhook] TELEGRAM_WEBHOOK_SECRET is not configured.');
+            return new NextResponse('Webhook not configured', { status: 503 });
+        }
+        const incomingSecret = req.headers.get('x-telegram-bot-api-secret-token');
+        if (!validWebhookSecret(incomingSecret, webhookSecret)) {
+            return new NextResponse('Unauthorized', { status: 401 });
+        }
+        const contentLength = Number(req.headers.get('content-length') || 0);
+        if (Number.isFinite(contentLength) && contentLength > 1024 * 1024) {
+            return new NextResponse('Payload too large', { status: 413 });
         }
 
         const body: TelegramUpdate = await req.json();
@@ -144,30 +177,37 @@ export async function POST(req: NextRequest) {
             if (command === '/login' || command === '/link') {
                 const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || 'https://pixedge.vercel.app';
 
-                // Generate 6-digit PIN
-                const pin = Math.floor(100000 + Math.random() * 900000).toString();
-                const pinKey = `telegram:login_pin:${pin}`;
-                
-                // Fetch user's Telegram profile photo URL
+                if (!redis) throw new Error('Redis credentials are required for Telegram PIN login.');
+                const allowed = await enforceRateLimit(
+                    `ratelimit:telegram:pin-request:${from.id}`,
+                    LOGIN_RATE_LIMIT,
+                    LOGIN_RATE_WINDOW_SECONDS
+                );
+                if (!allowed) {
+                    await sendMessage(chatId, '⏳ Too many login PIN requests. Please try again in 15 minutes.');
+                    return new NextResponse('OK');
+                }
+
+                // Generate a cryptographically secure PIN and store it before sending it.
                 const { getTelegramUserProfilePhoto } = await import('@/lib/telegram');
                 const photoUrl = await getTelegramUserProfilePhoto(from.id);
-
-                // Store in Redis if cloud is enabled
-                try {
-                    const { Redis } = await import('@upstash/redis');
-                    const redis = new Redis({
-                        url: process.env.UPSTASH_REDIS_REST_URL!,
-                        token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-                    });
-                    await redis.set(pinKey, JSON.stringify({
-                        id: from.id,
-                        first_name: from.first_name,
-                        username: from.username,
-                        photo_url: photoUrl || null
-                    }), { ex: 300 });
-                } catch (e) {
-                    console.error('Failed to store PIN in Redis:', e);
+                let pin = '';
+                let stored = false;
+                for (let attempt = 0; attempt < 5 && !stored; attempt++) {
+                    pin = randomInt(100000, 1000000).toString();
+                    const result = await redis.set(
+                        `telegram:login_pin:${pin}`,
+                        JSON.stringify({
+                            id: from.id,
+                            first_name: from.first_name,
+                            username: from.username,
+                            photo_url: photoUrl || null
+                        }),
+                        { ex: 300, nx: true }
+                    );
+                    stored = result === 'OK';
                 }
+                if (!stored) throw new Error('Could not allocate a unique Telegram login PIN.');
 
                 // Generate 1-Click Login URL with PIN
                 const directLoginUrl = `${baseUrl}/login?pin=${pin}`;
