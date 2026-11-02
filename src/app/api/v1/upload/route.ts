@@ -199,30 +199,38 @@ function parseMultipartUpload(req: NextRequest): Promise<ParsedMultipart> {
 }
 
 export async function POST(req: NextRequest) {
-    // Resolve authenticated userId (session or API key)
-    const userId = await resolveUserId(req);
-    const forwarded = req.headers.get('x-real-ip') || req.headers.get('x-forwarded-for') || 'anonymous';
-    const ip = forwarded.split(',')[0].trim().slice(0, 128) || 'anonymous';
+    let userId: string | undefined;
+    let ip = 'anonymous';
+    try {
+        userId = await resolveUserId(req);
+        const forwarded = req.headers.get('x-real-ip') || req.headers.get('x-forwarded-for') || 'anonymous';
+        ip = forwarded.split(',')[0].trim().slice(0, 128) || 'anonymous';
 
-    // Keep the documented anonymous/API-key upload tiers, with normalized IP keys.
-    const rateLimitKey = userId ? `upload:user:${userId}` : `upload:ip:${ip}`;
-    const rateLimitMax = userId ? 100 : 20;
-    const limit = await rateLimit(rateLimitKey, rateLimitMax, 60);
-
-    if (!limit.success) {
+        // Keep the documented authenticated and anonymous upload tiers.
+        const rateLimitKey = userId ? `upload:user:${userId}` : `upload:ip:${ip}`;
+        const rateLimitMax = userId ? 100 : 20;
+        const limit = await rateLimit(rateLimitKey, rateLimitMax, 60);
+        if (!limit.success) {
+            return NextResponse.json({
+                success: false,
+                error: {
+                    code: 'RATE_LIMIT_EXCEEDED',
+                    message: `Too many uploads. Try again in ${limit.remaining === 0 ? 'a minute' : 'a moment'}.`
+                }
+            }, {
+                status: 429,
+                headers: {
+                    'X-RateLimit-Limit': (limit.limit ?? rateLimitMax).toString(),
+                    'X-RateLimit-Remaining': (limit.remaining ?? 0).toString()
+                }
+            });
+        }
+    } catch (authOrLimitError) {
+        console.error('Upload authorization/rate-limit error:', authOrLimitError);
         return NextResponse.json({
             success: false,
-            error: {
-                code: 'RATE_LIMIT_EXCEEDED',
-                message: `Too many uploads. Try again in ${limit.remaining === 0 ? 'a minute' : 'a moment'}.`
-            }
-        }, {
-            status: 429,
-            headers: {
-                'X-RateLimit-Limit': (limit.limit ?? rateLimitMax).toString(),
-                'X-RateLimit-Remaining': (limit.remaining ?? 0).toString()
-            }
-        });
+            error: { code: 'AUTH_OR_RATE_LIMIT_UNAVAILABLE', message: 'Upload authentication or rate limiting is temporarily unavailable.' }
+        }, { status: 503 });
     }
 
     let parsed: ParsedMultipart;
