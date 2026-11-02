@@ -345,12 +345,16 @@ export async function POST(req: NextRequest) {
 
         // Atomic reservation prevents simultaneous uploads from claiming the same custom ID.
         const slugReservationKey = customId ? `slug:reservation:${id}` : null;
+        let reservationHeld = false;
         if (slugReservationKey) {
-            const reservation = await (await import('@upstash/redis')).Redis.fromEnv().set(
-                slugReservationKey,
-                userId || ip,
-                { ex: 600, nx: true }
-            );
+            const redisUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
+            const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
+            if (!redisUrl || !redisToken) {
+                return NextResponse.json({ success: false, error: { code: 'STORAGE_UNAVAILABLE', message: 'Custom IDs require Redis.' } }, { status: 503 });
+            }
+            const { Redis } = await import('@upstash/redis');
+            const lockRedis = new Redis({ url: redisUrl, token: redisToken });
+            const reservation = await lockRedis.set(slugReservationKey, userId || ip, { ex: 600, nx: true });
             if (reservation !== 'OK') {
                 const suggestions = generateSuggestions(id);
                 return NextResponse.json({
@@ -358,6 +362,7 @@ export async function POST(req: NextRequest) {
                     error: { code: 'ID_ALREADY_EXISTS', message: 'This custom ID is currently being claimed.', suggestions }
                 }, { status: 409 });
             }
+            reservationHeld = true;
         }
 
         // 2. Upload — gramjs MTProto (v2) or Bot API fallback (v1)
@@ -429,18 +434,12 @@ export async function POST(req: NextRequest) {
         }
 
         // Save to DB (with user tracking if logged in, and optional expiry)
-        try {
-            await saveImage(record, 'web', userId, expiresIn);
-        } finally {
-            if (slugReservationKey) {
-                try {
-                    const { Redis } = await import('@upstash/redis');
-                    const lockRedis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL!, token: process.env.UPSTASH_REDIS_REST_TOKEN! });
-                    await lockRedis.del(slugReservationKey);
-                } catch (releaseError) {
-                    console.error('Could not release upload ID reservation:', releaseError);
-                }
-            }
+        await saveImage(record, 'web', userId, expiresIn);
+        if (reservationHeld && slugReservationKey) {
+            const { Redis } = await import('@upstash/redis');
+            const lockRedis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL!, token: process.env.UPSTASH_REDIS_REST_TOKEN! });
+            await lockRedis.del(slugReservationKey);
+            reservationHeld = false;
         }
 
         const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ||
@@ -476,6 +475,15 @@ export async function POST(req: NextRequest) {
             error: { code: 'INTERNAL_ERROR', message: 'Failed to process media upload' }
         }, { status: 500 });
     } finally {
+        if (typeof reservationHeld !== 'undefined' && reservationHeld && typeof slugReservationKey !== 'undefined' && slugReservationKey) {
+            try {
+                const { Redis } = await import('@upstash/redis');
+                const lockRedis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL!, token: process.env.UPSTASH_REDIS_REST_TOKEN! });
+                await lockRedis.del(slugReservationKey);
+            } catch (releaseError) {
+                console.error('Could not release upload ID reservation:', releaseError);
+            }
+        }
         if (tempFilePath) {
             try {
                 await fs.promises.unlink(tempFilePath);
