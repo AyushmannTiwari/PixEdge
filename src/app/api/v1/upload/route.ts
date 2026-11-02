@@ -349,22 +349,20 @@ export async function POST(req: NextRequest) {
                     }
                 }, { status: 409 });
             }
-        } else {
-            id = generateId();
-        }
 
-        // Atomic reservation prevents simultaneous uploads from claiming the same custom ID.
-        const slugReservationKey = customId ? `slug:reservation:${id}` : null;
-        if (slugReservationKey) {
             const redisUrl = process.env.UPSTASH_REDIS_REST_URL?.trim();
             const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN?.trim();
             if (!redisUrl || !redisToken) {
-                return NextResponse.json({ success: false, error: { code: 'STORAGE_UNAVAILABLE', message: 'Custom IDs require Redis.' } }, { status: 503 });
+                return NextResponse.json({
+                    success: false,
+                    error: { code: 'STORAGE_UNAVAILABLE', message: 'Custom IDs require Redis.' }
+                }, { status: 503 });
             }
             const { Redis } = await import('@upstash/redis');
             const lockRedis = new Redis({ url: redisUrl, token: redisToken });
-            const reservation = await lockRedis.set(slugReservationKey, userId || ip, { ex: 600, nx: true });
-            if (reservation !== 'OK') {
+            slugReservationKey = `slug:reservation:${id}`;
+            const reserved = await lockRedis.set(slugReservationKey, userId || ip, { ex: 600, nx: true });
+            if (reserved !== 'OK') {
                 const suggestions = generateSuggestions(id);
                 return NextResponse.json({
                     success: false,
@@ -372,6 +370,8 @@ export async function POST(req: NextRequest) {
                 }, { status: 409 });
             }
             reservationHeld = true;
+        } else {
+            id = generateId();
         }
 
         // 2. Upload — gramjs MTProto (v2) or Bot API fallback (v1)
