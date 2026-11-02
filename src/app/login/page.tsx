@@ -236,6 +236,7 @@ function LoginPageContent() {
     const searchParams = useSearchParams();
     const { data: session } = useSession();
     const telegramWrapperRef = useRef<HTMLDivElement>(null);
+    const pinAutoLoginStarted = useRef(false);
 
     // Check for link token in URL
     useEffect(() => {
@@ -245,25 +246,40 @@ function LoginPageContent() {
         }
     }, [searchParams]);
 
-    // Handle Telegram URL params (from redirect or 1-click pin)
+    // Handle Telegram URL params (from redirect or one-click PIN)
     useEffect(() => {
-        // 1. Check for 1-click PIN in URL
         const pinFromUrl = searchParams.get('pin');
-        if (pinFromUrl && pinFromUrl.trim().length === 6) {
-            setPinCode(pinFromUrl.trim());
+        if (pinFromUrl && /^\d{6}$/.test(pinFromUrl.trim())) {
+            if (pinAutoLoginStarted.current) return;
+            pinAutoLoginStarted.current = true;
+            const pin = pinFromUrl.trim();
+            setPinCode(pin);
             setPinLoading(true);
-            signIn('telegram-pin', { pin: pinFromUrl.trim(), redirect: false }).then((result) => {
-                if (result?.error) {
-                    setError('Invalid or expired Telegram PIN. Send /login in bot to get a new PIN.');
+
+            // Remove the one-time credential from browser history before submitting it.
+            const cleanUrl = new URL(window.location.href);
+            cleanUrl.searchParams.delete('pin');
+            window.history.replaceState(window.history.state, '', cleanUrl.pathname + cleanUrl.search + cleanUrl.hash);
+
+            void (async () => {
+                try {
+                    const result = await signIn('telegram-pin', { pin, redirect: false });
+                    if (result?.error) {
+                        setPinCode('');
+                        setError('Invalid or expired Telegram PIN. Send /login in bot to get a new PIN.');
+                    } else {
+                        router.push('/dashboard');
+                    }
+                } catch {
+                    setPinCode('');
+                    setError('Telegram login could not be completed. Please request a new PIN.');
+                } finally {
                     setPinLoading(false);
-                } else {
-                    router.push('/dashboard');
                 }
-            });
+            })();
             return;
         }
 
-        // 2. Check for Telegram OAuth redirect params in URL
         const hash = searchParams.get('hash');
         const id = searchParams.get('id');
         if (hash && id) {
@@ -370,13 +386,18 @@ function LoginPageContent() {
         }
         setPinLoading(true);
         setError('');
-        const result = await signIn('telegram-pin', { pin: pinCode.trim(), redirect: false });
-        if (result?.error) {
-            setError('Invalid or expired Telegram PIN. Send /login in bot to get a new PIN.');
-        } else {
-            router.push('/dashboard');
+        try {
+            const result = await signIn('telegram-pin', { pin: pinCode.trim(), redirect: false });
+            if (result?.error) {
+                setError('Invalid, expired, or rate-limited Telegram PIN. Send /login in bot to get a new PIN.');
+            } else {
+                router.push('/dashboard');
+            }
+        } catch {
+            setError('Telegram PIN verification failed. Please try again.');
+        } finally {
+            setPinLoading(false);
         }
-        setPinLoading(false);
     };
 
     const handleSubmit = async (e: React.FormEvent) => {
