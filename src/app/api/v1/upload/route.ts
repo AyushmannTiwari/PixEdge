@@ -15,6 +15,19 @@ import { validateCustomId, generateSuggestions } from '@/lib/slugs';
 export const maxDuration = 300; // 5 minutes
 export const dynamic = 'force-dynamic';
 
+function extensionForMime(mimeType: string): string {
+    const type = (mimeType || "").split(";")[0].trim().toLowerCase();
+    const map: Record<string, string> = {
+        "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+        "image/gif": ".gif", "image/webp": ".webp", "image/avif": ".avif",
+        "image/bmp": ".bmp", "image/tiff": ".tif",
+        "video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov",
+        "video/x-matroska": ".mkv", "video/mpeg": ".mpeg", "video/3gpp": ".3gp"
+    };
+    return map[type] || ".bin";
+}
+
+
 // Resolve authenticated userId from session OR X-API-Key / Authorization header
 async function resolveUserId(req: NextRequest): Promise<string | undefined> {
     const session = await getServerSession(authOptions);
@@ -188,9 +201,10 @@ function parseMultipartUpload(req: NextRequest): Promise<ParsedMultipart> {
 export async function POST(req: NextRequest) {
     // Resolve authenticated userId (session or API key)
     const userId = await resolveUserId(req);
-    const ip = req.headers.get('x-forwarded-for') || 'anonymous';
+    const forwarded = req.headers.get('x-real-ip') || req.headers.get('x-forwarded-for') || 'anonymous';
+    const ip = forwarded.split(',')[0].trim().slice(0, 128) || 'anonymous';
 
-    // Authenticated users get 100 uploads/min; anonymous users get 20/min
+    // Keep the documented anonymous/API-key upload tiers, with normalized IP keys.
     const rateLimitKey = userId ? `upload:user:${userId}` : `upload:ip:${ip}`;
     const rateLimitMax = userId ? 100 : 20;
     const limit = await rateLimit(rateLimitKey, rateLimitMax, 60);
@@ -238,6 +252,25 @@ export async function POST(req: NextRequest) {
 
     try {
         const customId = typeof fields.customId === 'string' ? fields.customId.trim() : '';
+        const normalizedMime = (mimeType || '').split(';')[0].trim().toLowerCase();
+        const allowedMimeTypes = new Set([
+            'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
+            'image/avif', 'image/bmp', 'image/tiff',
+            'video/mp4', 'video/webm', 'video/quicktime', 'video/x-matroska',
+            'video/mpeg', 'video/3gpp'
+        ]);
+        if (!allowedMimeTypes.has(normalizedMime)) {
+            return NextResponse.json({
+                success: false,
+                error: { code: 'UNSUPPORTED_MEDIA_TYPE', message: 'Only supported image and video formats are allowed.' }
+            }, { status: 415 });
+        }
+        if (!Number.isFinite(fileSize) || fileSize <= 0) {
+            return NextResponse.json({
+                success: false,
+                error: { code: 'INVALID_FILE_SIZE', message: 'The uploaded file size could not be verified.' }
+            }, { status: 400 });
+        }
 
         // Optional target folder for organizing the upload
         const folder = typeof fields.folder === 'string' && fields.folder.trim() ? fields.folder.trim() : undefined;
@@ -294,8 +327,6 @@ export async function POST(req: NextRequest) {
             }
 
             id = validation.sanitized!;
-
-            // Check if ID already exists
             const existing = await getImage(id);
             if (existing) {
                 const suggestions = generateSuggestions(id);
@@ -310,6 +341,23 @@ export async function POST(req: NextRequest) {
             }
         } else {
             id = generateId();
+        }
+
+        // Atomic reservation prevents simultaneous uploads from claiming the same custom ID.
+        const slugReservationKey = customId ? `slug:reservation:${id}` : null;
+        if (slugReservationKey) {
+            const reservation = await (await import('@upstash/redis')).Redis.fromEnv().set(
+                slugReservationKey,
+                userId || ip,
+                { ex: 600, nx: true }
+            );
+            if (reservation !== 'OK') {
+                const suggestions = generateSuggestions(id);
+                return NextResponse.json({
+                    success: false,
+                    error: { code: 'ID_ALREADY_EXISTS', message: 'This custom ID is currently being claimed.', suggestions }
+                }, { status: 409 });
+            }
         }
 
         // 2. Upload — gramjs MTProto (v2) or Bot API fallback (v1)
@@ -381,7 +429,19 @@ export async function POST(req: NextRequest) {
         }
 
         // Save to DB (with user tracking if logged in, and optional expiry)
-        await saveImage(record, 'web', userId, expiresIn);
+        try {
+            await saveImage(record, 'web', userId, expiresIn);
+        } finally {
+            if (slugReservationKey) {
+                try {
+                    const { Redis } = await import('@upstash/redis');
+                    const lockRedis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL!, token: process.env.UPSTASH_REDIS_REST_TOKEN! });
+                    await lockRedis.del(slugReservationKey);
+                } catch (releaseError) {
+                    console.error('Could not release upload ID reservation:', releaseError);
+                }
+            }
+        }
 
         const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ||
             (req.headers.get('host') ? `http://${req.headers.get('host')}` : '');
@@ -402,7 +462,7 @@ export async function POST(req: NextRequest) {
             data: {
                 id,
                 url: `${baseUrl}/i/${id}`,
-                direct_url: `${baseUrl}/i/${id}.jpg`,
+                direct_url: `${baseUrl}/i/${id}${extensionForMime(normalizedMime)}`,
                 timestamp: record.created_at,
                 expires_at: expiresIn ? Date.now() + expiresIn * 1000 : null,
                 upload_mode: usedGram ? 'mtproto_v2' : 'botapi_v1',
