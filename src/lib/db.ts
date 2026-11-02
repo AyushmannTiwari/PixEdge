@@ -641,39 +641,48 @@ export async function verifyApiKey(key: string): Promise<string | null> {
 
 // Telegram account linking functions
 export async function createLinkToken(telegramId: string | number): Promise<string> {
-    if (!redis) throw new Error('Redis not configured');
-    const token = crypto.randomBytes(16).toString('hex');
-    // Store token -> telegramId mapping (expires in 5 minutes)
-    await redis.set(`link_token:${token}`, telegramId.toString(), { ex: 300 });
-    return token;
+    if (!redis) throw new Error("Redis not configured");
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const token = crypto.randomBytes(16).toString("hex");
+        const stored = await redis.set(`link_token:${token}`, telegramId.toString(), { ex: 300, nx: true });
+        if (stored === "OK") return token;
+    }
+    throw new Error("Could not create a unique Telegram link token.");
 }
 
 export async function verifyLinkToken(token: string): Promise<string | null> {
-    if (!redis) return null;
-    const telegramId = await redis.get(`link_token:${token}`);
-    if (telegramId) {
-        await redis.del(`link_token:${token}`); // One-time use
-    }
-    return telegramId as string | null;
+    if (!redis || !/^[a-f0-9]{32}$/i.test(token)) return null;
+    const telegramId = await redis.eval<string | null>(
+        "return redis.call('GETDEL', KEYS[1])",
+        [`link_token:${token}`],
+        []
+    );
+    return telegramId ? String(telegramId) : null;
 }
 
 export async function linkTelegramToAccount(telegramId: string, webUserId: string): Promise<void> {
-    if (!redis) return;
-
-    // Clean up any stale mappings to maintain a strict 1:1 bidirectional mapping
-    const existingWebUser = await redis.get(`telegram_link:${telegramId}`);
-    if (existingWebUser && existingWebUser !== webUserId) {
-        await redis.del(`web_link:${existingWebUser}`);
-    }
-
-    const existingTelegram = await redis.get(`web_link:${webUserId}`);
-    if (existingTelegram && existingTelegram !== telegramId) {
-        await redis.del(`telegram_link:${existingTelegram}`);
-    }
-
-    // Bidirectional mapping
-    await redis.set(`telegram_link:${telegramId}`, webUserId);
-    await redis.set(`web_link:${webUserId}`, telegramId);
+    if (!redis) throw new Error("Redis not configured");
+    await redis.eval<number>(
+        `
+        local telegramId = ARGV[1]
+        local webUserId = ARGV[2]
+        local telegramKey = KEYS[1]
+        local webKey = KEYS[2]
+        local previousWeb = redis.call('GET', telegramKey)
+        if previousWeb and previousWeb ~= webUserId then
+            redis.call('DEL', 'web_link:' .. previousWeb)
+        end
+        local previousTelegram = redis.call('GET', webKey)
+        if previousTelegram and previousTelegram ~= telegramId then
+            redis.call('DEL', 'telegram_link:' .. previousTelegram)
+        end
+        redis.call('SET', telegramKey, webUserId)
+        redis.call('SET', webKey, telegramId)
+        return 1
+        `,
+        [`telegram_link:${telegramId}`, `web_link:${webUserId}`],
+        [telegramId, webUserId]
+    );
 }
 
 export async function getLinkedWebAccount(telegramId: string | number): Promise<string | null> {
