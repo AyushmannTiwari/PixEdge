@@ -258,6 +258,26 @@ export async function POST(req: NextRequest) {
         }, { status: 500 });
     }
 
+    } catch (parseError: any) {
+        if (parseError.message === 'MISSING_FILE' || parseError.message === 'EMPTY_BODY') {
+            return NextResponse.json({
+                success: false,
+                error: { code: 'MISSING_FILE', message: 'No file provided in request' }
+            }, { status: 400 });
+        }
+        if (parseError.message === 'INVALID_CONTENT_TYPE') {
+            return NextResponse.json({
+                success: false,
+                error: { code: 'INVALID_REQUEST', message: 'Content-Type must be multipart/form-data' }
+            }, { status: 400 });
+        }
+        console.error('Multipart parse error:', parseError);
+        return NextResponse.json({
+            success: false,
+            error: { code: 'UPLOAD_FAILED', message: 'Failed to process file upload stream' }
+        }, { status: 500 });
+    }
+
     const { fields, tempFilePath, fileName, fileSize, mimeType } = parsed;
 
     try {
