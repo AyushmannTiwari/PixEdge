@@ -442,14 +442,8 @@ export async function POST(req: NextRequest) {
             usedGram = false;
         }
 
-        // Save to DB (with user tracking if logged in, and optional expiry)
+        // Save to DB (with user tracking if logged in, and optional expiry).
         await saveImage(record, 'web', userId, expiresIn);
-        if (reservationHeld && slugReservationKey) {
-            const { Redis } = await import('@upstash/redis');
-            const lockRedis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL!, token: process.env.UPSTASH_REDIS_REST_TOKEN! });
-            await lockRedis.del(slugReservationKey);
-            reservationHeld = false;
-        }
 
         const baseUrl = process.env.NEXT_PUBLIC_BASE_URL ||
             (req.headers.get('host') ? `http://${req.headers.get('host')}` : '');
@@ -484,7 +478,7 @@ export async function POST(req: NextRequest) {
             error: { code: 'INTERNAL_ERROR', message: 'Failed to process media upload' }
         }, { status: 500 });
     } finally {
-        if (typeof reservationHeld !== 'undefined' && reservationHeld && typeof slugReservationKey !== 'undefined' && slugReservationKey) {
+        if (reservationHeld && slugReservationKey) {
             try {
                 const { Redis } = await import('@upstash/redis');
                 const lockRedis = new Redis({ url: process.env.UPSTASH_REDIS_REST_URL!, token: process.env.UPSTASH_REDIS_REST_TOKEN! });
