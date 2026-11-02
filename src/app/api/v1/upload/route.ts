@@ -236,6 +236,8 @@ export async function POST(req: NextRequest) {
     }
 
     let parsed: ParsedMultipart;
+    let reservationHeld = false;
+    let slugReservationKey: string | null = null;
     try {
         parsed = await parseMultipartUpload(req);
     } catch (parseError: any) {
